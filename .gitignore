@@ -1,0 +1,26 @@
+Now open `.gitignore` in any text editor and make sure it contains:
+```
+# Environment & secrets
+.env
+
+# Python virtual environment
+venv/
+.venv/
+env/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Database (optional — remove this line if you want to keep db in repo)
+data/
+*.db
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
