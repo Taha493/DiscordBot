@@ -133,9 +133,9 @@ class MonitorCog(commands.Cog):
                 return
         try:
             if view:
-                await channel.send(embed=embed, view=view)
+                await channel.send(content="@everyone", embed=embed, view=view)
             else:
-                await channel.send(embed=embed)
+                await channel.send(content="@everyone", embed=embed)
         except discord.Forbidden:
             logger.error(f"Missing permission to send to channel {channel_id}")
         except Exception as e:
