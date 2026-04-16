@@ -3,6 +3,11 @@ cogs/monitor.py — the async monitoring engine.
 
 Runs a background task that loops over every registered site,
 fetches it, diffs it, and fires Discord notifications on changes.
+
+Fixes:
+- Loop restarts automatically if it crashes (on_monitor_loop_error)
+- Watchdog task detects if loop has silently stopped and restarts it
+- All exceptions are caught per-site so one bad site can't kill the loop
 """
 
 import asyncio
@@ -19,97 +24,147 @@ from config import DEFAULT_INTERVAL
 
 logger = logging.getLogger(__name__)
 
+# How many seconds before watchdog considers the loop dead
+WATCHDOG_TIMEOUT = DEFAULT_INTERVAL * 3
+
 
 class MonitorCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
-        self._down_sites: set[int] = set()   # site IDs currently down
+        self._down_sites: set[int] = set()
+        self._last_loop_time: datetime = datetime.now(timezone.utc)
         self.monitor_loop.start()
+        self.watchdog.start()
 
     def cog_unload(self):
         self.monitor_loop.cancel()
+        self.watchdog.cancel()
 
     # ── Main loop ──────────────────────────────
 
     @tasks.loop(seconds=DEFAULT_INTERVAL)
     async def monitor_loop(self):
-        sites = db.get_all_sites()
-        if not sites:
-            return
-
-        tasks_list = [self._check_site(dict(site)) for site in sites]
-        await asyncio.gather(*tasks_list, return_exceptions=True)
+        # Update heartbeat timestamp
+        self._last_loop_time = datetime.now(timezone.utc)
+        try:
+            sites = db.get_all_sites()
+            if not sites:
+                return
+            tasks_list = [self._check_site(dict(site)) for site in sites]
+            await asyncio.gather(*tasks_list, return_exceptions=True)
+        except Exception as e:
+            logger.error(f"[MONITOR LOOP ERROR] {e}", exc_info=True)
 
     @monitor_loop.before_loop
     async def before_loop(self):
         await self.bot.wait_until_ready()
         logger.info("Monitor loop ready, starting checks…")
 
+    @monitor_loop.error
+    async def on_monitor_loop_error(self, error: Exception):
+        """Called when the loop itself crashes — restarts it automatically."""
+        logger.error(f"[LOOP CRASHED] {error} — restarting in 10s…", exc_info=True)
+        await asyncio.sleep(10)
+        if not self.monitor_loop.is_running():
+            self.monitor_loop.restart()
+            logger.info("[LOOP RESTARTED] Monitor loop restarted after crash")
+
+    # ── Watchdog ───────────────────────────────
+
+    @tasks.loop(seconds=60)
+    async def watchdog(self):
+        """
+        Runs every 60 seconds. If the monitor loop hasn't fired in
+        WATCHDOG_TIMEOUT seconds, it's considered dead and gets restarted.
+        """
+        if not self.bot.is_ready():
+            return
+        now = datetime.now(timezone.utc)
+        seconds_since = (now - self._last_loop_time).total_seconds()
+        if seconds_since > WATCHDOG_TIMEOUT:
+            logger.warning(
+                f"[WATCHDOG] Monitor loop has been silent for {int(seconds_since)}s "
+                f"(timeout={WATCHDOG_TIMEOUT}s) — restarting…"
+            )
+            if self.monitor_loop.is_running():
+                self.monitor_loop.restart()
+            else:
+                self.monitor_loop.start()
+            self._last_loop_time = datetime.now(timezone.utc)
+            logger.info("[WATCHDOG] Monitor loop restarted successfully")
+
+    @watchdog.before_loop
+    async def before_watchdog(self):
+        await self.bot.wait_until_ready()
+
     # ── Per-site check ─────────────────────────
 
     async def _check_site(self, site: dict):
-        site_id = site["id"]
-        url = site["url"]
-        channel_id = int(site["channel_id"])
-        old_hash = site["last_hash"]
+        try:
+            site_id = site["id"]
+            url = site["url"]
+            channel_id = int(site["channel_id"])
+            old_hash = site["last_hash"]
 
-        html, status = await fetch_page(url)
+            html, status = await fetch_page(url)
 
-        # ── Site is DOWN ──
-        if status != 200 or html is None:
-            if site_id not in self._down_sites:
-                self._down_sites.add(site_id)
-                embed = build_down_embed(url, status)
+            # ── Site is DOWN ──
+            if status != 200 or html is None:
+                if site_id not in self._down_sites:
+                    self._down_sites.add(site_id)
+                    embed = build_down_embed(url, status)
+                    await self._send_embed(channel_id, embed)
+                db.update_site_state(site_id, old_hash or "", status)
+                return
+
+            # ── Site is UP — was it down before? ──
+            if site_id in self._down_sites:
+                self._down_sites.discard(site_id)
+                embed = build_restored_embed(url)
                 await self._send_embed(channel_id, embed)
-            db.update_site_state(site_id, old_hash or "", status)
-            return
 
-        # ── Site is UP — was it down before? ──
-        if site_id in self._down_sites:
-            self._down_sites.discard(site_id)
-            embed = build_restored_embed(url)
-            await self._send_embed(channel_id, embed)
+            # ── Compute hash of meaningful text ──
+            text = extract_text(html)
+            new_hash = hash_content(text)
 
-        # ── Compute hash of meaningful text ──
-        text = extract_text(html)
-        new_hash = hash_content(text)
+            # First visit — just store baseline
+            if old_hash is None:
+                db.update_site_state(site_id, new_hash, status)
+                logger.info(f"[BASELINE] {url}")
+                return
 
-        # First visit — just store baseline
-        if old_hash is None:
+            # No change
+            if new_hash == old_hash:
+                db.update_site_state(site_id, new_hash, status)
+                return
+
+            # ── Change detected ──
+            logger.info(f"[CHANGE] {url}")
+
+            old_text = self._get_cached_text(site_id) or ""
+            diff = diff_content(old_text, text)
+
+            detected_at = datetime.now(timezone.utc)
+            embed = build_change_embed(
+                url=url,
+                change_type=diff["change_type"],
+                added=diff["added"],
+                removed=diff["removed"],
+                detected_at=detected_at,
+            )
+
+            view = _ChangeView(url)
+            await self._send_embed(channel_id, embed, view=view)
+
+            # Log & update state
+            db.log_change(site_id, diff["change_type"], diff["summary"])
             db.update_site_state(site_id, new_hash, status)
-            logger.info(f"[BASELINE] {url}")
-            return
+            self._cache_text(site_id, text)
 
-        # No change
-        if new_hash == old_hash:
-            db.update_site_state(site_id, new_hash, status)
-            return
-
-        # ── Change detected ──
-        logger.info(f"[CHANGE] {url}")
-
-        # We need old text — re-fetch from stored hash isn't possible,
-        # so we store old text in a side table. For simplicity we do a
-        # second fetch of the old stored text via a lightweight cache.
-        old_text = self._get_cached_text(site_id) or ""
-        diff = diff_content(old_text, text)
-
-        detected_at = datetime.now(timezone.utc)
-        embed = build_change_embed(
-            url=url,
-            change_type=diff["change_type"],
-            added=diff["added"],
-            removed=diff["removed"],
-            detected_at=detected_at,
-        )
-
-        view = _ChangeView(url)
-        await self._send_embed(channel_id, embed, view=view)
-
-        # Log & update state
-        db.log_change(site_id, diff["change_type"], diff["summary"])
-        db.update_site_state(site_id, new_hash, status)
-        self._cache_text(site_id, text)
+        except Exception as e:
+            # Catch ALL exceptions per site so one bad site
+            # never kills the entire monitoring loop
+            logger.error(f"[SITE CHECK ERROR] {site.get('url', '?')} — {e}", exc_info=True)
 
     # ── Text cache (in-memory, per site) ───────
 
@@ -156,7 +211,7 @@ class MonitorCog(commands.Cog):
             db.update_site_state(site_id, None, status)
 
 
-# ── "View Changes" button view ─────────────────────────────────────────────────
+# ── "View Changes" button view ────────────────────────────────────────────────
 
 class _ChangeView(discord.ui.View):
     def __init__(self, url: str):
