@@ -4,7 +4,6 @@ cogs/commands.py — slash commands: /add  /remove  /list  /help  /status
 
 import logging
 import re
-from urllib.parse import urlparse
 
 import discord
 from discord import app_commands
@@ -27,11 +26,33 @@ URL_RE = re.compile(
 
 
 def _validate_url(url: str) -> str | None:
-    """Return cleaned URL or None if invalid."""
     url = url.strip()
     if not url.startswith(("http://", "https://")):
         url = "https://" + url
     return url if URL_RE.match(url) else None
+
+
+async def _safe_respond(
+    interaction: discord.Interaction,
+    content: str = None,
+    embed: discord.Embed = None,
+    ephemeral: bool = True,
+):
+    """
+    Always works regardless of whether the interaction has been
+    deferred or not. Checks state and picks the right method.
+    """
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(
+                content=content, embed=embed, ephemeral=ephemeral
+            )
+        else:
+            await interaction.response.send_message(
+                content=content, embed=embed, ephemeral=ephemeral
+            )
+    except Exception as e:
+        logger.error(f"[RESPOND ERROR] {e}")
 
 
 class CommandsCog(commands.Cog):
@@ -97,7 +118,6 @@ class CommandsCog(commands.Cog):
             added_by=str(interaction.user),
         )
 
-        # Prime baseline immediately
         monitor_cog = self.bot.cogs.get("MonitorCog")
         if monitor_cog:
             await monitor_cog.prime_site(site_id, clean_url)
@@ -139,13 +159,14 @@ class CommandsCog(commands.Cog):
     # ─────────────────────────────────────────
     @app_commands.command(name="list", description="Show all monitored websites")
     async def list_sites(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
         guild_id = str(interaction.guild_id)
         sites = db.get_sites(guild_id)
         embed = build_list_embed(
             [dict(s) for s in sites],
             interaction.guild.name
         )
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
     # ─────────────────────────────────────────
     #  /status
@@ -157,7 +178,10 @@ class CommandsCog(commands.Cog):
         sites = db.get_sites(guild_id)
 
         if not sites:
-            await interaction.followup.send("No sites monitored yet. Use `/add` to start.", ephemeral=True)
+            await interaction.followup.send(
+                "No sites monitored yet. Use `/add` to start.",
+                ephemeral=True
+            )
             return
 
         lines = []
@@ -175,6 +199,7 @@ class CommandsCog(commands.Cog):
     # ─────────────────────────────────────────
     @app_commands.command(name="help", description="Show all bot commands")
     async def help_cmd(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
         embed = discord.Embed(
             title="🤖 Site Monitor Bot — Help",
             description="A 24/7 website change & uptime monitor.",
@@ -190,24 +215,26 @@ class CommandsCog(commands.Cog):
         embed.add_field(name="/status", value="Quick up/down status for all sites.", inline=False)
         embed.add_field(name="/help", value="Show this help message.", inline=False)
         embed.set_footer(text=f"Max {MAX_SITES} sites per server.")
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
     # ─────────────────────────────────────────
     #  Error handler
     # ─────────────────────────────────────────
     @add.error
     @remove.error
-    async def permission_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError):
+    async def permission_error(
+        self,
+        interaction: discord.Interaction,
+        error: app_commands.AppCommandError
+    ):
         if isinstance(error, app_commands.MissingPermissions):
-            await interaction.response.send_message(
-                "❌ You need **Manage Server** permission to use this command.",
-                ephemeral=True
+            await _safe_respond(
+                interaction,
+                content="❌ You need **Manage Server** permission to use this command."
             )
         else:
             logger.error(f"Command error: {error}")
-            await interaction.response.send_message(
-                "⚠️ An unexpected error occurred.", ephemeral=True
-            )
+            await _safe_respond(interaction, content="⚠️ An unexpected error occurred.")
 
 
 async def setup(bot: commands.Bot):
